@@ -10,25 +10,20 @@ from browser_use.llm import ChatOpenAI, ChatGoogle, ChatOpenRouter
 
 app = FastAPI(title="MedsGo Browser Agent Hub")
 
-# --- 1. ARTIFACT & ENVIRONMENT SETUP ---
+# --- ARTIFACT & ENVIRONMENT SETUP ---
 ARTIFACT_DIR = "/data/artifacts"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
-
-# Mount the folder so we can access files via URL
 app.mount("/view", StaticFiles(directory=ARTIFACT_DIR), name="view")
-
-# Fetch the public URL from the environment, defaulting to localhost for local dev
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:80").rstrip("/")
 
+# --- IN-MEMORY JOB STORE ---
+active_jobs = {}
 
-# --- 2. MODEL FACTORY ---
 def get_llm_model(provider: str, model: str):
     provider = provider.lower()
     try:
-        if provider == "google": 
-            return ChatGoogle(model=model)
-        elif provider == "openai": 
-            return ChatOpenAI(model=model)
+        if provider == "google": return ChatGoogle(model=model)
+        elif provider == "openai": return ChatOpenAI(model=model)
         elif provider == "openrouter":
             key = os.getenv("OPENROUTER_API_KEY")
             if not key: raise ValueError("OPENROUTER_API_KEY missing")
@@ -37,79 +32,114 @@ def get_llm_model(provider: str, model: str):
             key = os.getenv("ZAI_API_KEY")
             if not key: raise ValueError("ZAI_API_KEY missing")
             return ChatOpenAI(model=model, api_key=key, base_url="https://api.z.ai/v1")
-        
-        # Default fallback to save costs on simple tasks
         return ChatGoogle(model="gemini-flash-lite-latest")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"LLM Config Error: {str(e)}")
 
+# --- BACKGROUND TASK ---
+async def background_runner(job_id: str, task: str, provider: str, model: str):
+    try:
+        active_jobs[job_id]["status"] = "running"
+        llm = get_llm_model(provider, model)
+        profile = BrowserProfile(user_data_dir="/data/profiles/default")
 
-# --- 3. CORE AGENT LOGIC ---
-async def execute_agent(task: str, provider: str, model: str):
-    """Core function used by both API and UI"""
-    llm = get_llm_model(provider, model)
-    
-    # Persistent profile for CS-Cart logins
-    profile = BrowserProfile(user_data_dir="/data/profiles/default")
-
-    agent = Agent(
-        task=task,
-        llm=llm,
-        use_vision=True,
-        browser_profile=profile
-    )
-    
-    history = await agent.run()
-    
-# --- AUTOMATIC SCREENSHOT EXTRACTION ---
-    final_screenshot_url = None
-    
-    # Check if history exists and if the last step has a screenshot
-    if history.history:
-        last_step = history.history[-1]
+        agent = Agent(
+            task=task,
+            llm=llm,
+            use_vision=True,
+            browser_profile=profile
+        )
         
-        # In newer browser-use versions, it's state.get_screenshot() or similar.
-        # We try a few fallback methods to be robust against minor library updates.
-        screenshot_b64 = None
+        # We store the agent reference in case we ever want to implement live logs/steps later
+        active_jobs[job_id]["agent"] = agent
         
-        # Try method 1 (what the error suggested)
-        if hasattr(last_step.state, 'get_screenshot'):
-            screenshot_b64 = last_step.state.get_screenshot()
-        # Try method 2 (sometimes it's moved to the result object)
-        elif hasattr(last_step, 'result') and hasattr(last_step.result, 'screenshot'):
-             screenshot_b64 = last_step.result.screenshot
-        # Try method 3 (the old way, just in case)
-        elif hasattr(last_step.state, 'screenshot'):
-             screenshot_b64 = last_step.state.screenshot
-             
-        if screenshot_b64:
-            filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
-            filepath = os.path.join(ARTIFACT_DIR, filename)
-            
-            # Decode base64 and save to the persistent volume
-            with open(filepath, "wb") as f:
-                f.write(base64.b64decode(screenshot_b64))
-            
-            # Construct the dynamic URL using your CapRover domain
-            final_screenshot_url = f"{PUBLIC_URL}/view/{filename}"
+        history = await agent.run()
+        
+        final_screenshot_url = None
+        if history.history:
+            last_step = history.history[-1]
+            screenshot_b64 = None
+            if hasattr(last_step.state, 'get_screenshot'):
+                screenshot_b64 = last_step.state.get_screenshot()
+            elif hasattr(last_step, 'result') and hasattr(last_step.result, 'screenshot'):
+                screenshot_b64 = last_step.result.screenshot
+            elif hasattr(last_step.state, 'screenshot'):
+                screenshot_b64 = last_step.state.screenshot
+                 
+            if screenshot_b64:
+                filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
+                filepath = os.path.join(ARTIFACT_DIR, filename)
+                with open(filepath, "wb") as f:
+                    f.write(base64.b64decode(screenshot_b64))
+                final_screenshot_url = f"{PUBLIC_URL}/view/{filename}"
 
-    return {
-        "status": "success",
-        "final_result": history.final_result(),
-        "final_screenshot": final_screenshot_url,
-        "steps_taken": len(history.history)
-    }
+        active_jobs[job_id].update({
+            "status": "completed",
+            "data": {
+                "final_result": history.final_result(),
+                "final_screenshot": final_screenshot_url,
+                "steps_taken": len(history.history)
+            }
+        })
+        
+    except asyncio.CancelledError:
+        # This catches the specific signal sent by our /stop endpoint
+        active_jobs[job_id]["status"] = "cancelled"
+        # We catch and swallow the CancelledError so the server logs stay clean
+    except Exception as e:
+        active_jobs[job_id].update({
+            "status": "failed",
+            "error": str(e)
+        })
 
-
-# --- 4. API ENDPOINT (For n8n / Jules) ---
+# --- API ENDPOINTS ---
 @app.post("/run")
 async def run_task_api(
     task: str = Body(...), 
     provider: str = Body("google"), 
     model: str = Body("gemini-flash-lite-latest")
 ):
-    return await execute_agent(task, provider, model)
+    job_id = uuid.uuid4().hex
+    active_jobs[job_id] = {"status": "pending"}
+    
+    # Create an asyncio task and store its reference to allow cancellation
+    job_task = asyncio.create_task(background_runner(job_id, task, provider, model))
+    active_jobs[job_id]["task_ref"] = job_task
+    
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "status_url": f"{PUBLIC_URL}/status/{job_id}",
+        "stop_url": f"{PUBLIC_URL}/stop/{job_id}" # NEW
+    }
 
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in active_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_info = active_jobs[job_id]
+    return {
+        "status": job_info["status"],
+        "data": job_info.get("data"),
+        "error": job_info.get("error")
+    }
+
+@app.post("/stop/{job_id}")
+async def stop_job(job_id: str):
+    if job_id not in active_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_info = active_jobs[job_id]
+    if job_info["status"] in ["completed", "failed", "cancelled"]:
+        return {"status": job_info["status"], "message": "Job is no longer running."}
+    
+    task_ref = job_info.get("task_ref")
+    if task_ref and not task_ref.done():
+        task_ref.cancel() # This interrupts the agent and triggers the CancelledError
+        return {"status": "success", "message": f"Cancellation requested for job {job_id}."}
+        
+    return {"status": "error", "message": "Could not cancel task."}
 
 # --- 5. GRADIO UI (For Manual Oversight) ---
 def create_ui():
