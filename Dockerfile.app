@@ -1,31 +1,28 @@
 # Use the official pre-built image
 FROM browseruse/browseruse:latest
 
-# 1. Switch to root for setup and installation
 USER root
 
-# 2. Install web server components
+# Install web server components
 RUN uv pip install uvicorn gradio
 
-# 3. Prepare the workspace
 WORKDIR /app
 COPY app.py .
 
-# 4. Ensure the non-root user (browseruse) owns the app and data directories
-# The base image already creates the 'browseruse' user and /data volume
-RUN chown -R browseruse:browseruse /app /data
+# --- NEW: Fix permissions for uv cache ---
+# We point the cache to /app/.cache and make sure the user owns it
+ENV UV_CACHE_DIR=/app/.cache/uv
+RUN mkdir -p /app/.cache/uv && chown -R browseruse:browseruse /app
 
-# 5. Environment Overrides
+# Ensure /data is also owned by the user
+RUN mkdir -p /data/profiles && chown -R browseruse:browseruse /data
+
 ENV BROWSER_USE_HEADLESS=true \
-    PYTHONUNBUFFERED=1 \
-    DATA_DIR=/data
+    PYTHONUNBUFFERED=1
 
-# 6. SWITCH TO NON-ROOT USER
 USER browseruse
 
-# CapRover usually likes port 80 or 3000
 EXPOSE 80
 
-# 7. Start the Hub
-# uv run ensures we use the correct environment created by the base image
+# Start the Hub
 ENTRYPOINT ["uv", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
