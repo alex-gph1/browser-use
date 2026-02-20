@@ -61,20 +61,37 @@ async def execute_agent(task: str, provider: str, model: str):
     
     history = await agent.run()
     
-    # --- AUTOMATIC SCREENSHOT EXTRACTION ---
+# --- AUTOMATIC SCREENSHOT EXTRACTION ---
     final_screenshot_url = None
     
-    # browser-use saves the state at each step. We grab the absolute last one.
-    if history.history and history.history[-1].state.screenshot:
-        filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
-        filepath = os.path.join(ARTIFACT_DIR, filename)
+    # Check if history exists and if the last step has a screenshot
+    if history.history:
+        last_step = history.history[-1]
         
-        # Decode base64 and save to the persistent volume
-        with open(filepath, "wb") as f:
-            f.write(base64.b64decode(history.history[-1].state.screenshot))
+        # In newer browser-use versions, it's state.get_screenshot() or similar.
+        # We try a few fallback methods to be robust against minor library updates.
+        screenshot_b64 = None
         
-        # Construct the dynamic URL using your CapRover domain
-        final_screenshot_url = f"{PUBLIC_URL}/view/{filename}"
+        # Try method 1 (what the error suggested)
+        if hasattr(last_step.state, 'get_screenshot'):
+            screenshot_b64 = last_step.state.get_screenshot()
+        # Try method 2 (sometimes it's moved to the result object)
+        elif hasattr(last_step, 'result') and hasattr(last_step.result, 'screenshot'):
+             screenshot_b64 = last_step.result.screenshot
+        # Try method 3 (the old way, just in case)
+        elif hasattr(last_step.state, 'screenshot'):
+             screenshot_b64 = last_step.state.screenshot
+             
+        if screenshot_b64:
+            filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
+            filepath = os.path.join(ARTIFACT_DIR, filename)
+            
+            # Decode base64 and save to the persistent volume
+            with open(filepath, "wb") as f:
+                f.write(base64.b64decode(screenshot_b64))
+            
+            # Construct the dynamic URL using your CapRover domain
+            final_screenshot_url = f"{PUBLIC_URL}/view/{filename}"
 
     return {
         "status": "success",
