@@ -26,7 +26,7 @@ def get_llm_model(provider: str, model: str):
             return ChatOpenAI(model=model, api_key=key, base_url="https://api.z.ai/v1")
         
         # Default fallback
-        return ChatGoogle(model="gemini-flash-lite-latest")
+        return ChatGoogle(model="gemini-flash-latest")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"LLM Config Error: {str(e)}")
 
@@ -35,7 +35,7 @@ def get_llm_model(provider: str, model: str):
 async def run_task(
     task: str = Body(...), 
     provider: str = Body("google"), 
-    model: str = Body("gemini-flash-lite-latest")
+    model: str = Body("gemini-flash-latest")
 ):
     llm = get_llm_model(provider, model)
     
