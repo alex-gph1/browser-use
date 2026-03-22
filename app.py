@@ -41,7 +41,12 @@ async def background_runner(job_id: str, task: str, provider: str, model: str):
     try:
         active_jobs[job_id]["status"] = "running"
         llm = get_llm_model(provider, model)
-        profile = BrowserProfile(user_data_dir="/data/profiles/default")
+        
+        # Add the Docker-stabilizing arguments here!
+        profile = BrowserProfile(
+            user_data_dir="/data/profiles/default",
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+        )
 
         agent = Agent(
             task=task,
