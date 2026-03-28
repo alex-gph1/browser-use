@@ -176,9 +176,6 @@ class StorageStateWatchdog(BaseWatchdog):
 					'(browser likely shutting down after a timeout)'
 				)
 				return
-			if not cdp_session:
-				self.logger.debug('[StorageStateWatchdog] Skipping storage state save because no CDP session is available')
-				return
 
 			save_path = path or self.browser_session.browser_profile.storage_state
 			if not save_path:
