@@ -1,10 +1,13 @@
 # Use the official pre-built image
 FROM browseruse/browseruse:latest
 
+# Add a build argument. Change its value in captain-definition to force a fresh build.
+ARG CACHE_BUSTER=1
+
 USER root
 
-# Install web server components
-RUN uv pip install uvicorn gradio
+# Install web server components and ensure the core library is up-to-date
+RUN uv pip install --upgrade browser-use uvicorn gradio
 
 WORKDIR /app
 COPY app.py .

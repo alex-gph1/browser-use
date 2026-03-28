@@ -125,7 +125,7 @@ async def background_runner(
         viewport_size = {"width": size_config["width"], "height": size_config["height"]}
         
         profile = BrowserProfile(
-            user_data_dir="/data/profiles/default",
+            user_data_dir=f"/data/profiles/{job_id}",
             args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
             window_size=viewport_size,
             viewport=viewport_size,
@@ -322,8 +322,9 @@ async def execute_agent(task: str, provider: str, model: str, fallback_provider:
     try:
         llm, fallback_llm = get_llm_models(provider, model, fallback_provider, fallback_model)
         
+        run_id = uuid.uuid4().hex[:8]
         profile = BrowserProfile(
-            user_data_dir="/data/profiles/default",
+            user_data_dir=f"/data/profiles/ui_manual_{run_id}",
             args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
         )
 
