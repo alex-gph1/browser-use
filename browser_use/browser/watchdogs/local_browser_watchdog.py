@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import tempfile
@@ -157,7 +158,7 @@ class LocalBrowserWatchdog(BaseWatchdog):
 				process = psutil.Process(subprocess.pid)
 
 				# Wait for CDP to be ready and get the URL
-				cdp_url = await self._wait_for_cdp_url(debug_port)
+				cdp_url = await self._wait_for_cdp_url(debug_port, process=subprocess)
 
 				# Success! Clean up only the temp dirs we created but didn't use
 				currently_used_dir = str(profile.user_data_dir)
@@ -405,27 +406,50 @@ class LocalBrowserWatchdog(BaseWatchdog):
 		return port
 
 	@staticmethod
-	async def _wait_for_cdp_url(port: int, timeout: float = 30) -> str:
+	async def _wait_for_cdp_url(port: int, timeout: float = 60, process: asyncio.subprocess.Process | None = None) -> str:
 		"""Wait for the browser to start and return the CDP URL."""
 		import aiohttp
 
-		start_time = asyncio.get_event_loop().time()
+		loop = asyncio.get_event_loop()
+		start_time = loop.time()
+		last_error: Exception | None = None
 
-		while asyncio.get_event_loop().time() - start_time < timeout:
-			try:
-				async with aiohttp.ClientSession() as session:
+		async with aiohttp.ClientSession() as session:
+			while loop.time() - start_time < timeout:
+				try:
 					async with session.get(f'http://127.0.0.1:{port}/json/version') as resp:
 						if resp.status == 200:
 							# Chrome is ready
 							return f'http://127.0.0.1:{port}/'
-						else:
-							# Chrome is starting up and returning 502/500 errors
-							await asyncio.sleep(0.1)
-			except Exception:
-				# Connection error - Chrome might not be ready yet
-				await asyncio.sleep(0.1)
 
-		raise TimeoutError(f'Browser did not start within {timeout} seconds')
+						# Chrome is starting up and returning temporary errors
+						await asyncio.sleep(0.1)
+				except Exception as e:
+					# Connection error - Chrome might not be ready yet
+					last_error = e
+
+					# If the process already exited, fail fast with useful diagnostics
+					if process and process.returncode is not None:
+						stderr_tail = ''
+						try:
+							if process.stderr:
+								stderr_bytes = await process.stderr.read()
+								stderr_tail = stderr_bytes.decode(errors='ignore')[-2000:]
+						except Exception as log_e:
+							logging.getLogger(__name__).debug(f'Error reading stderr from exited browser process: {log_e}')
+						raise RuntimeError(
+							f'Browser process exited before CDP was ready (port={port}, returncode={process.returncode}). '
+							f'Stderr tail: {stderr_tail}'
+						) from e
+					await asyncio.sleep(0.1)
+
+		if last_error:
+			raise TimeoutError(
+				f'Browser did not expose CDP at http://127.0.0.1:{port}/json/version within {timeout}s '
+				f'(last error: {type(last_error).__name__}: {last_error})'
+			) from last_error
+
+		raise TimeoutError(f'Browser did not expose CDP at http://127.0.0.1:{port}/json/version within {timeout}s')
 
 	@staticmethod
 	async def _cleanup_process(process: psutil.Process) -> None:

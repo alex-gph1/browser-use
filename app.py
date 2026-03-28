@@ -2,6 +2,8 @@ import asyncio
 import base64
 import os
 import uuid
+from typing import Any
+
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.staticfiles import StaticFiles
 import gradio as gr
@@ -19,28 +21,67 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:80").rstrip("/")
 # --- IN-MEMORY JOB STORE ---
 active_jobs = {}
 
-def get_llm_model(provider: str, model: str):
+# --- LLM DEFAULTS/FALLBACKS (ENV-DRIVEN) ---
+DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "google")
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-flash-lite-latest")
+FALLBACK_LLM_PROVIDER = os.getenv("FALLBACK_LLM_PROVIDER")
+FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL")
+
+
+def _build_llm(provider: str, model: str):
     provider = provider.lower()
+    if provider == "google":
+        return ChatGoogle(model=model)
+    if provider == "openai":
+        return ChatOpenAI(model=model)
+    if provider == "openrouter":
+        key = os.getenv("OPENROUTER_API_KEY")
+        if not key:
+            raise ValueError("OPENROUTER_API_KEY missing")
+        return ChatOpenRouter(model=model, api_key=key)
+    if provider == "z.ai":
+        key = os.getenv("ZAI_API_KEY")
+        if not key:
+            raise ValueError("ZAI_API_KEY missing")
+        return ChatOpenAI(model=model, api_key=key, base_url="https://api.z.ai/v1")
+    raise ValueError(f"Unsupported provider '{provider}'. Use one of: google, openai, openrouter, z.ai")
+
+
+def get_llm_models(
+    provider: str | None,
+    model: str | None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+) -> tuple[Any, Any | None]:
+    """Build primary/fallback LLMs using request params with env-based defaults."""
+    primary_provider = (provider or DEFAULT_LLM_PROVIDER).strip().lower()
+    primary_model = (model or DEFAULT_LLM_MODEL).strip()
+    fallback_provider_resolved = (fallback_provider or FALLBACK_LLM_PROVIDER or "").strip().lower()
+    fallback_model_resolved = (fallback_model or FALLBACK_LLM_MODEL or "").strip()
+
     try:
-        if provider == "google": return ChatGoogle(model=model)
-        elif provider == "openai": return ChatOpenAI(model=model)
-        elif provider == "openrouter":
-            key = os.getenv("OPENROUTER_API_KEY")
-            if not key: raise ValueError("OPENROUTER_API_KEY missing")
-            return ChatOpenRouter(model=model, api_key=key)
-        elif provider == "z.ai":
-            key = os.getenv("ZAI_API_KEY")
-            if not key: raise ValueError("ZAI_API_KEY missing")
-            return ChatOpenAI(model=model, api_key=key, base_url="https://api.z.ai/v1")
-        return ChatGoogle(model="gemini-flash-lite-latest")
+        primary_llm = _build_llm(primary_provider, primary_model)
+        fallback_llm = None
+        if fallback_provider_resolved and fallback_model_resolved:
+            fallback_llm = _build_llm(fallback_provider_resolved, fallback_model_resolved)
+        elif fallback_provider_resolved or fallback_model_resolved:
+            raise ValueError("Both fallback_provider and fallback_model must be set together.")
+        return primary_llm, fallback_llm
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"LLM Config Error: {str(e)}")
 
 # --- BACKGROUND TASK ---
-async def background_runner(job_id: str, task: str, provider: str, model: str):
+async def background_runner(
+    job_id: str,
+    task: str,
+    provider: str | None,
+    model: str | None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+):
     try:
         active_jobs[job_id]["status"] = "running"
-        llm = get_llm_model(provider, model)
+        llm, fallback_llm = get_llm_models(provider, model, fallback_provider, fallback_model)
         
         # Add the Docker-stabilizing arguments here!
         profile = BrowserProfile(
@@ -51,6 +92,7 @@ async def background_runner(job_id: str, task: str, provider: str, model: str):
         agent = Agent(
             task=task,
             llm=llm,
+            fallback_llm=fallback_llm,
             use_vision=True,
             browser_profile=profile
         )
@@ -101,14 +143,25 @@ async def background_runner(job_id: str, task: str, provider: str, model: str):
 @app.post("/run")
 async def run_task_api(
     task: str = Body(...), 
-    provider: str = Body("google"), 
-    model: str = Body("gemini-flash-lite-latest")
+    provider: str | None = Body(None),
+    model: str | None = Body(None),
+    fallback_provider: str | None = Body(None),
+    fallback_model: str | None = Body(None),
 ):
     job_id = uuid.uuid4().hex
     active_jobs[job_id] = {"status": "pending"}
     
     # Create an asyncio task and store its reference to allow cancellation
-    job_task = asyncio.create_task(background_runner(job_id, task, provider, model))
+    job_task = asyncio.create_task(
+        background_runner(
+            job_id=job_id,
+            task=task,
+            provider=provider,
+            model=model,
+            fallback_provider=fallback_provider,
+            fallback_model=fallback_model,
+        )
+    )
     active_jobs[job_id]["task_ref"] = job_task
     
     return {
@@ -155,11 +208,20 @@ def create_ui():
             provider_drop = gr.Dropdown(
                 choices=["google", "openai", "openrouter", "z.ai"], 
                 label="Provider", 
-                value="google"
+                value=DEFAULT_LLM_PROVIDER
             )
             model_input = gr.Textbox(
                 label="Model Name", 
-                value="gemini-flash-lite-latest"
+                value=DEFAULT_LLM_MODEL
+            )
+            fallback_provider_drop = gr.Dropdown(
+                choices=["", "google", "openai", "openrouter", "z.ai"],
+                label="Fallback Provider (optional)",
+                value=FALLBACK_LLM_PROVIDER or ""
+            )
+            fallback_model_input = gr.Textbox(
+                label="Fallback Model Name (optional)",
+                value=FALLBACK_LLM_MODEL or ""
             )
         
         task_input = gr.Textbox(
@@ -175,8 +237,8 @@ def create_ui():
 
         # Wire up the button to the core async function
         run_btn.click(
-            fn=lambda t, p, m: asyncio.run(execute_agent(t, p, m)),
-            inputs=[task_input, provider_drop, model_input],
+            fn=lambda t, p, m, fp, fm: asyncio.run(execute_agent(t, p, m, fp or None, fm or None)),
+            inputs=[task_input, provider_drop, model_input, fallback_provider_drop, fallback_model_input],
             outputs=output
         )
     return ui
