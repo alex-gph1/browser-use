@@ -1,6 +1,7 @@
 """Local browser watchdog for managing browser subprocess lifecycle."""
 
 import asyncio
+import logging
 import os
 import shutil
 import tempfile
@@ -398,8 +399,8 @@ class LocalBrowserWatchdog(BaseWatchdog):
 							if process.stderr:
 								stderr_bytes = await process.stderr.read()
 								stderr_tail = stderr_bytes.decode(errors='ignore')[-2000:]
-						except Exception:
-							pass
+						except Exception as log_e:
+							logging.getLogger(__name__).debug(f'Error reading stderr from exited browser process: {log_e}')
 						raise RuntimeError(
 							f'Browser process exited before CDP was ready (port={port}, returncode={process.returncode}). '
 							f'Stderr tail: {stderr_tail}'
