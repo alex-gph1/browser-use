@@ -6,9 +6,11 @@ from typing import Any
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import PlainTextResponse
 import gradio as gr
 from browser_use import Agent, BrowserProfile
 from browser_use.llm import ChatOpenAI, ChatGoogle, ChatOpenRouter
+from browser_use.tools.service import Tools
 
 app = FastAPI(title="Browser Agent Hub")
 
@@ -78,23 +80,83 @@ async def background_runner(
     model: str | None,
     fallback_provider: str | None = None,
     fallback_model: str | None = None,
+    device_view: str | None = "mobile",
+    device_size: str | None = "medium",
+    include_tools: list[str] | None = None,
+    generate_gif: bool | None = False,
+    include_attributes: list[str] | None = None,
 ):
     try:
         active_jobs[job_id]["status"] = "running"
         llm, fallback_llm = get_llm_models(provider, model, fallback_provider, fallback_model)
         
-        # Add the Docker-stabilizing arguments here!
+        # Viewport configuration
+        viewports = {
+            "mobile": {
+                "low": {"width": 320, "height": 640},
+                "medium": {"width": 390, "height": 844},
+                "high": {"width": 430, "height": 932},
+                "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+            },
+            "tablet": {
+                "low": {"width": 768, "height": 1024},
+                "medium": {"width": 810, "height": 1080},
+                "high": {"width": 1024, "height": 1366},
+                "ua": "Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+            },
+            "desktop": {
+                "low": {"width": 1280, "height": 720},
+                "medium": {"width": 1920, "height": 1080},
+                "high": {"width": 2560, "height": 1440},
+                "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            }
+        }
+        
+        view_type = (device_view or "mobile").lower()
+        if view_type not in viewports:
+            view_type = "mobile"
+            
+        size_type = (device_size or "medium").lower()
+        if size_type not in ["low", "medium", "high"]:
+            size_type = "medium"
+            
+        view_config = viewports[view_type]
+        size_config = view_config[size_type]
+        viewport_size = {"width": size_config["width"], "height": size_config["height"]}
+        
         profile = BrowserProfile(
             user_data_dir="/data/profiles/default",
-            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
+            window_size=viewport_size,
+            viewport=viewport_size,
+            user_agent=view_config["ua"]
         )
+
+        tools = None
+        if include_tools is not None:
+            temp_tools = Tools()
+            all_actions = list(temp_tools.registry.registry.actions.keys())
+            exclude_actions = [a for a in all_actions if a not in include_tools]
+            tools = Tools(exclude_actions=exclude_actions)
+            
+        session_fs_path = os.path.join(ARTIFACT_DIR, job_id)
+        os.makedirs(session_fs_path, exist_ok=True)
+        
+        gif_path = None
+        if generate_gif:
+            gif_filename = f"history_gif_{job_id}.gif"
+            gif_path = os.path.join(ARTIFACT_DIR, gif_filename)
 
         agent = Agent(
             task=task,
             llm=llm,
             fallback_llm=fallback_llm,
             use_vision=True,
-            browser_profile=profile
+            browser_profile=profile,
+            tools=tools,
+            file_system_path=session_fs_path,
+            generate_gif=gif_path if generate_gif else False,
+            include_attributes=include_attributes if include_attributes is not None else []
         )
         
         # We store the agent reference in case we ever want to implement live logs/steps later
@@ -120,11 +182,16 @@ async def background_runner(
                     f.write(base64.b64decode(screenshot_b64))
                 final_screenshot_url = f"{PUBLIC_URL}/view/{filename}"
 
+        final_gif_url = None
+        if gif_path and os.path.exists(gif_path):
+            final_gif_url = f"{PUBLIC_URL}/view/{os.path.basename(gif_path)}"
+
         active_jobs[job_id].update({
             "status": "completed",
             "data": {
                 "final_result": history.final_result(),
                 "final_screenshot": final_screenshot_url,
+                "final_gif": final_gif_url,
                 "steps_taken": len(history.history)
             }
         })
@@ -140,6 +207,46 @@ async def background_runner(
         })
 
 # --- API ENDPOINTS ---
+
+@app.get("/help", response_class=PlainTextResponse)
+async def get_help():
+    help_text = f"""# Browser Agent Hub API
+
+## Overview
+This API allows agents to request automated browser interactions.
+
+## Base URL
+{PUBLIC_URL}
+
+## Endpoints
+
+### 1. `POST /run`
+Starts a new browser agent job.
+**Request Body (JSON):**
+- `task` (string, required): The task description for the agent.
+- `provider` (string, optional): LLM provider (e.g., 'google', 'openai', 'openrouter', 'z.ai').
+- `model` (string, optional): Specific LLM model to use.
+- `fallback_provider` (string, optional): Fallback LLM provider.
+- `fallback_model` (string, optional): Fallback LLM model.
+- `device_view` (string, optional): Viewport device. One of 'mobile' (default), 'tablet', 'desktop'.
+- `device_size` (string, optional): Viewport dimension constraint. One of 'low', 'medium' (default), 'high'.
+- `include_tools` (list of strings, optional): Explicit list of tool names to enable. If omitted, all tools are enabled. File operations are strictly sandboxed per job.
+- `generate_gif` (boolean, optional): Whether to generate a GIF of the agent's actions (default: false).
+- `include_attributes` (list of strings, optional): HTML attributes to include in the DOM context passed to the model (e.g. `["data-testid", "class"]`).
+
+**Response:**
+Returns a JSON object with `job_id`, `status_url` to poll the job state, and `stop_url` to cancel.
+
+### 2. `GET /status/{{job_id}}`
+Retrieves the current status and output of a job.
+**Response Data:**
+Contains status (`pending`, `running`, `completed`, `failed`, `cancelled`), and `data` objects with `final_result`, `final_screenshot` URL, and `final_gif` URL if generated.
+
+### 3. `POST /stop/{{job_id}}`
+Cancels an active job. Returns success message or error if already complete.
+"""
+    return help_text
+
 @app.post("/run")
 async def run_task_api(
     task: str = Body(...), 
@@ -147,6 +254,11 @@ async def run_task_api(
     model: str | None = Body(None),
     fallback_provider: str | None = Body(None),
     fallback_model: str | None = Body(None),
+    device_view: str | None = Body("mobile"),
+    device_size: str | None = Body("medium"),
+    include_tools: list[str] | None = Body(None),
+    generate_gif: bool | None = Body(False),
+    include_attributes: list[str] | None = Body(None),
 ):
     job_id = uuid.uuid4().hex
     active_jobs[job_id] = {"status": "pending"}
@@ -160,6 +272,11 @@ async def run_task_api(
             model=model,
             fallback_provider=fallback_provider,
             fallback_model=fallback_model,
+            device_view=device_view,
+            device_size=device_size,
+            include_tools=include_tools,
+            generate_gif=generate_gif,
+            include_attributes=include_attributes,
         )
     )
     active_jobs[job_id]["task_ref"] = job_task
