@@ -10,7 +10,7 @@ import gradio as gr
 from browser_use import Agent, BrowserProfile
 from browser_use.llm import ChatOpenAI, ChatGoogle, ChatOpenRouter
 
-app = FastAPI(title="MedsGo Browser Agent Hub")
+app = FastAPI(title="Browser Agent Hub")
 
 # --- ARTIFACT & ENVIRONMENT SETUP ---
 ARTIFACT_DIR = "/data/artifacts"
@@ -200,9 +200,47 @@ async def stop_job(job_id: str):
     return {"status": "error", "message": "Could not cancel task."}
 
 # --- 5. GRADIO UI (For Manual Oversight) ---
+
+async def execute_agent(task: str, provider: str, model: str, fallback_provider: str | None = None, fallback_model: str | None = None):
+    try:
+        llm, fallback_llm = get_llm_models(provider, model, fallback_provider, fallback_model)
+        
+        profile = BrowserProfile(
+            user_data_dir="/data/profiles/default",
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+        )
+
+        agent = Agent(
+            task=task,
+            llm=llm,
+            fallback_llm=fallback_llm,
+            use_vision=True,
+            browser_profile=profile
+        )
+        
+        history = await agent.run()
+        
+        final_screenshot = None
+        if history.history:
+            last_step = history.history[-1]
+            if hasattr(last_step.state, 'get_screenshot'):
+                final_screenshot = "Screenshot captured but not saved to disk in UI mode."
+        
+        return {
+            "status": "completed",
+            "final_result": history.final_result(),
+            "steps_taken": len(history.history),
+            "final_screenshot": final_screenshot
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e)
+        }
+
 def create_ui():
-    with gr.Blocks(title="MedsGo Agent HQ", theme=gr.themes.Soft()) as ui:
-        gr.Markdown("# 🤖 MedsGo Browser Agent Hub")
+    with gr.Blocks(title="Agent HQ") as ui:
+        gr.Markdown("# 🤖 Browser Agent Hub")
         
         with gr.Row():
             provider_drop = gr.Dropdown(
@@ -227,7 +265,7 @@ def create_ui():
         task_input = gr.Textbox(
             label="Task Description", 
             lines=4, 
-            placeholder="e.g. Go to medsgo.ph/admin and check pending orders..."
+            placeholder="e.g. Go to example.com/admin and check pending orders..."
         )
         
         with gr.Row():
