@@ -2,7 +2,7 @@
 Tests for the fallback_llm feature in Agent.
 
 Tests verify that when the primary LLM fails with rate limit (429) or server errors (503, 502, 500, 504),
-the agent automatically switches to the fallback LLM and continues execution.
+the agent retries the current request with fallback LLM while keeping primary as default for future steps.
 """
 
 from unittest.mock import AsyncMock
@@ -119,21 +119,21 @@ class TestFallbackLLMParameter:
 		# Before fallback
 		assert agent.is_using_fallback_llm is False
 		assert agent.current_llm_model == 'primary-model'
+		assert agent.fallback_retry_count == 0
 
-		# Trigger fallback
+		# Fallback should be considered available for retryable errors
 		error = ModelRateLimitError(message='Rate limit', status_code=429, model='primary')
-		agent._try_switch_to_fallback_llm(error)
-
-		# After fallback
-		assert agent.is_using_fallback_llm is True
-		assert agent.current_llm_model == 'fallback-model'
+		assert agent._try_switch_to_fallback_llm(error) is True
+		assert agent.is_using_fallback_llm is False
+		assert agent.current_llm_model == 'primary-model'
+		assert agent.fallback_retry_count == 0
 
 
 class TestFallbackLLMSwitching:
-	"""Test the fallback switching logic in _try_switch_to_fallback_llm."""
+	"""Test fallback eligibility logic in _try_switch_to_fallback_llm."""
 
 	def test_switch_on_rate_limit_error(self):
-		"""Test that agent switches to fallback on ModelRateLimitError."""
+		"""Test that rate-limit errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -145,11 +145,11 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
-		assert agent._using_fallback_llm is True
+		assert agent.llm is primary
+		assert agent._using_fallback_llm is False
 
 	def test_switch_on_503_error(self):
-		"""Test that agent switches to fallback on 503 Service Unavailable."""
+		"""Test that 503 errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -161,11 +161,11 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
-		assert agent._using_fallback_llm is True
+		assert agent.llm is primary
+		assert agent._using_fallback_llm is False
 
 	def test_switch_on_500_error(self):
-		"""Test that agent switches to fallback on 500 Internal Server Error."""
+		"""Test that 500 errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -177,10 +177,10 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
+		assert agent.llm is primary
 
 	def test_switch_on_502_error(self):
-		"""Test that agent switches to fallback on 502 Bad Gateway."""
+		"""Test that 502 errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -192,7 +192,7 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
+		assert agent.llm is primary
 
 	def test_no_switch_on_400_error(self):
 		"""Test that agent does NOT switch on 400 Bad Request (not retryable)."""
@@ -211,7 +211,7 @@ class TestFallbackLLMSwitching:
 		assert agent._using_fallback_llm is False
 
 	def test_switch_on_401_error(self):
-		"""Test that agent switches to fallback on 401 Unauthorized (API key error)."""
+		"""Test that 401 errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -223,11 +223,11 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
-		assert agent._using_fallback_llm is True
+		assert agent.llm is primary
+		assert agent._using_fallback_llm is False
 
 	def test_switch_on_402_error(self):
-		"""Test that agent switches to fallback on 402 Payment Required (insufficient credits)."""
+		"""Test that 402 errors are eligible for fallback."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -239,8 +239,8 @@ class TestFallbackLLMSwitching:
 		result = agent._try_switch_to_fallback_llm(error)
 
 		assert result is True
-		assert agent.llm is fallback
-		assert agent._using_fallback_llm is True
+		assert agent.llm is primary
+		assert agent._using_fallback_llm is False
 
 	def test_no_switch_when_no_fallback_configured(self):
 		"""Test that agent returns False when no fallback is configured."""
@@ -255,8 +255,8 @@ class TestFallbackLLMSwitching:
 		assert result is False
 		assert agent.llm is primary
 
-	def test_no_switch_when_already_using_fallback(self):
-		"""Test that agent doesn't switch again when already using fallback."""
+	def test_repeatable_fallback_check(self):
+		"""Test that fallback eligibility can be checked repeatedly (non-persistent fallback mode)."""
 		from browser_use import Agent
 
 		primary = create_mock_llm('primary-model')
@@ -264,16 +264,16 @@ class TestFallbackLLMSwitching:
 
 		agent = Agent(task='Test task', llm=primary, fallback_llm=fallback)
 
-		# First switch succeeds
+		# First check succeeds
 		error = ModelRateLimitError(message='Rate limit', status_code=429, model='primary')
 		result = agent._try_switch_to_fallback_llm(error)
 		assert result is True
-		assert agent.llm is fallback
+		assert agent.llm is primary
 
-		# Second switch fails - already using fallback
+		# Second check also succeeds
 		result = agent._try_switch_to_fallback_llm(error)
-		assert result is False
-		assert agent.llm is fallback  # Still on fallback
+		assert result is True
+		assert agent.llm is primary
 
 
 class TestFallbackLLMIntegration:
@@ -349,7 +349,7 @@ class TestFallbackLLMIntegration:
 
 	@pytest.mark.asyncio
 	async def test_get_model_output_switches_to_fallback_on_rate_limit(self, browser_session):
-		"""Test that get_model_output automatically switches to fallback on rate limit."""
+		"""Test that get_model_output retries with fallback on rate limit."""
 		from browser_use import Agent
 
 		# Create agent first with a working mock LLM
@@ -374,12 +374,13 @@ class TestFallbackLLMIntegration:
 
 		messages: list[BaseMessage] = [UserMessage(content='Test message')]
 
-		# This should switch to fallback and succeed
+		# This should retry with fallback and succeed
 		result = await agent.get_model_output(messages)
 
 		assert result is not None
-		assert agent.llm is fallback
-		assert agent._using_fallback_llm is True
+		assert agent.llm is primary
+		assert agent._using_fallback_llm is False
+		assert agent.fallback_retry_count == 1
 
 	@pytest.mark.asyncio
 	async def test_get_model_output_raises_when_no_fallback(self, browser_session):
