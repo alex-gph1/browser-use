@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 import uuid
 from typing import Any
@@ -13,6 +14,7 @@ from browser_use.llm import ChatOpenAI, ChatGoogle, ChatOpenRouter
 from browser_use.tools.service import Tools
 
 app = FastAPI(title="Browser Agent Hub")
+logger = logging.getLogger(__name__)
 
 # --- ARTIFACT & ENVIRONMENT SETUP ---
 ARTIFACT_DIR = "/data/artifacts"
@@ -28,9 +30,33 @@ DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "google")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-flash-lite-latest")
 FALLBACK_LLM_PROVIDER = os.getenv("FALLBACK_LLM_PROVIDER")
 FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL")
-AGENT_MAX_FAILURES = int(os.getenv("AGENT_MAX_FAILURES", "8"))
-AGENT_STEP_TIMEOUT = int(os.getenv("AGENT_STEP_TIMEOUT", "240"))
-AGENT_LLM_TIMEOUT = int(os.getenv("AGENT_LLM_TIMEOUT", "120"))
+def _get_int_env(name: str, default: int | None, *, allow_empty: bool = False) -> int | None:
+    """Parse integer env vars safely with a warning fallback.
+
+    Returns the provided default when unset or invalid and logs a warning.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip()
+    if not value:
+        if allow_empty:
+            return default
+        logger.warning("Environment variable %s is empty. Falling back to default: %s", name, default)
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Environment variable %s has invalid integer value %r. Falling back to default: %s", name, raw, default)
+        return default
+
+
+AGENT_MAX_FAILURES = _get_int_env("AGENT_MAX_FAILURES", 8)
+AGENT_STEP_TIMEOUT = _get_int_env("AGENT_STEP_TIMEOUT", 240)
+# Keep Agent smart provider defaults unless explicitly configured.
+AGENT_LLM_TIMEOUT = _get_int_env("AGENT_LLM_TIMEOUT", None, allow_empty=True)
 
 
 def _build_llm(provider: str, model: str):

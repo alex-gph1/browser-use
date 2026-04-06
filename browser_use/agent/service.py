@@ -371,6 +371,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Fallback LLM configuration
 		self._fallback_llm: BaseChatModel | None = fallback_llm
 		self._using_fallback_llm: bool = False
+		self._fallback_retry_count: int = 0
 		self._original_llm: BaseChatModel = llm  # Store original for reference
 		self.directly_open_url = directly_open_url
 		self.include_recent_events = include_recent_events
@@ -419,6 +420,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.token_cost_service.register_llm(llm)
 		self.token_cost_service.register_llm(page_extraction_llm)
 		self.token_cost_service.register_llm(judge_llm)
+		if self._fallback_llm is not None:
+			self.token_cost_service.register_llm(self._fallback_llm)
 		if self.settings.message_compaction and self.settings.message_compaction.compaction_llm:
 			self.token_cost_service.register_llm(self.settings.message_compaction.compaction_llm)
 
@@ -645,7 +648,14 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	@property
 	def current_llm_model(self) -> str:
 		"""Get the model name of the currently active LLM."""
+		if self._using_fallback_llm and self._fallback_llm is not None and hasattr(self._fallback_llm, 'model'):
+			return self._fallback_llm.model
 		return self.llm.model if hasattr(self.llm, 'model') else 'unknown'
+
+	@property
+	def fallback_retry_count(self) -> int:
+		"""Number of per-request fallback retries attempted during the current run."""
+		return self._fallback_retry_count
 
 	async def _check_and_update_downloads(self, context: str = '') -> None:
 		"""Check for new downloads and update available file paths."""
@@ -1955,6 +1965,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			assert self._fallback_llm is not None
 			try:
 				self._using_fallback_llm = True
+				self._fallback_retry_count += 1
 				return await self._invoke_model_for_output(
 					llm=self._fallback_llm,
 					input_messages=input_messages,
@@ -1964,10 +1975,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except ValidationError:
 				raise
 			except (ModelRateLimitError, ModelProviderError) as fallback_error:
-				self.logger.warning(
-					f'⚠️ Fallback LLM also failed ({type(fallback_error).__name__}: {fallback_error.message}), '
-					're-raising fallback error'
-				)
+				self._log_fallback_retry_failure(primary_error=e, fallback_error=fallback_error)
 				raise
 			finally:
 				self._using_fallback_llm = False
@@ -2026,10 +2034,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return False
 
 		self._log_fallback_switch(error, self._fallback_llm)
-
-		# Register the fallback LLM for token cost tracking
-		self.token_cost_service.register_llm(self._fallback_llm)
-
 		return True
 
 	def _log_fallback_switch(self, error: ModelRateLimitError | ModelProviderError, fallback: BaseChatModel) -> None:
@@ -2042,6 +2046,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.warning(
 			f'⚠️ Primary LLM ({original_model}) failed with {error_type} (status={status_code}), '
 			f'switching to fallback LLM ({fallback_model})'
+		)
+
+	def _log_fallback_retry_failure(
+		self, primary_error: ModelRateLimitError | ModelProviderError, fallback_error: ModelRateLimitError | ModelProviderError
+	) -> None:
+		"""Log when the fallback retry fails and we re-raise the fallback exception."""
+		self.logger.warning(
+			f'⚠️ Fallback LLM also failed ({type(fallback_error).__name__}: {fallback_error.message}) '
+			f'after primary LLM failed ({type(primary_error).__name__}: {primary_error.message}); '
+			're-raising fallback error'
 		)
 
 	async def _log_agent_run(self) -> None:
@@ -2198,7 +2212,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	def _log_agent_event(self, max_steps: int, agent_run_error: str | None = None) -> None:
 		"""Sent the agent event for this run to telemetry"""
 
-		token_summary = self.token_cost_service.get_usage_tokens_for_model(self.llm.model)
+		active_model = self.llm.model
+		if self._fallback_retry_count > 0 and self._fallback_llm is not None and hasattr(self._fallback_llm, 'model'):
+			active_model = f'{self.llm.model} (fallback retries with {self._fallback_llm.model}: {self._fallback_retry_count})'
+		token_summary = self._get_total_token_summary()
 
 		# Prepare action_history data correctly
 		action_history_data = []
@@ -2229,7 +2246,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.telemetry.capture(
 			AgentTelemetryEvent(
 				task=self.task,
-				model=self.llm.model,
+				model=active_model,
 				model_provider=self.llm.provider,
 				max_steps=max_steps,
 				max_actions_per_step=self.settings.max_actions_per_step,
@@ -2244,10 +2261,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				action_history=action_history_data,
 				urls_visited=self.history.urls(),
 				steps=self.state.n_steps,
-				total_input_tokens=token_summary.prompt_tokens,
-				total_output_tokens=token_summary.completion_tokens,
-				prompt_cached_tokens=token_summary.prompt_cached_tokens,
-				total_tokens=token_summary.total_tokens,
+				total_input_tokens=token_summary['prompt_tokens'],
+				total_output_tokens=token_summary['completion_tokens'],
+				prompt_cached_tokens=token_summary['prompt_cached_tokens'],
+				total_tokens=token_summary['total_tokens'],
 				total_duration_seconds=self.history.total_duration_seconds(),
 				success=self.history.is_successful(),
 				final_result_response=final_result_str,
@@ -2259,6 +2276,24 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				judge_impossible_task=judge_impossible_task,
 			)
 		)
+
+	def _get_total_token_summary(self) -> dict[str, int]:
+		"""Get aggregate token usage across all models used during this run."""
+		total_prompt_tokens = 0
+		total_prompt_cached_tokens = 0
+		total_completion_tokens = 0
+
+		for entry in self.token_cost_service.usage_history:
+			total_prompt_tokens += entry.usage.prompt_tokens
+			total_prompt_cached_tokens += entry.usage.prompt_cached_tokens or 0
+			total_completion_tokens += entry.usage.completion_tokens
+
+		return {
+			'prompt_tokens': total_prompt_tokens,
+			'prompt_cached_tokens': total_prompt_cached_tokens,
+			'completion_tokens': total_completion_tokens,
+			'total_tokens': total_prompt_tokens + total_completion_tokens,
+		}
 
 	async def take_step(self, step_info: AgentStepInfo | None = None) -> tuple[bool, bool]:
 		"""Take a step

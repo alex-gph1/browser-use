@@ -119,12 +119,14 @@ class TestFallbackLLMParameter:
 		# Before fallback
 		assert agent.is_using_fallback_llm is False
 		assert agent.current_llm_model == 'primary-model'
+		assert agent.fallback_retry_count == 0
 
 		# Fallback should be considered available for retryable errors
 		error = ModelRateLimitError(message='Rate limit', status_code=429, model='primary')
 		assert agent._try_switch_to_fallback_llm(error) is True
 		assert agent.is_using_fallback_llm is False
 		assert agent.current_llm_model == 'primary-model'
+		assert agent.fallback_retry_count == 0
 
 
 class TestFallbackLLMSwitching:
@@ -378,6 +380,7 @@ class TestFallbackLLMIntegration:
 		assert result is not None
 		assert agent.llm is primary
 		assert agent._using_fallback_llm is False
+		assert agent.fallback_retry_count == 1
 
 	@pytest.mark.asyncio
 	async def test_get_model_output_raises_when_no_fallback(self, browser_session):

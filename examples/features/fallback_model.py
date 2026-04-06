@@ -3,7 +3,8 @@ Example: Using a fallback LLM model.
 
 When the primary LLM fails with rate limits (429), authentication errors (401),
 payment/credit errors (402), or server errors (500, 502, 503, 504), the agent
-automatically switches to the fallback model and continues execution.
+retries that specific request with the fallback model and then continues using
+the primary model for the next request.
 
 Note: The primary LLM will first exhaust its own retry logic (typically 5 attempts
 with exponential backoff) before the fallback is triggered. This means transient errors
@@ -45,10 +46,8 @@ async def main():
 	result = await agent.run()
 	print(result)
 
-	# You can check if fallback was used:
-	if agent.is_using_fallback_llm:
-		print('Note: Agent switched to fallback LLM during execution')
-		print(f'Current model: {agent.current_llm_model}')
+	if agent.fallback_retry_count > 0:
+		print(f'Note: Fallback LLM was used for {agent.fallback_retry_count} request(s) during execution')
 
 
 if __name__ == '__main__':
