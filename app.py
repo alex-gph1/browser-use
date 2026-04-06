@@ -28,6 +28,9 @@ DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "google")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gemini-flash-lite-latest")
 FALLBACK_LLM_PROVIDER = os.getenv("FALLBACK_LLM_PROVIDER")
 FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL")
+AGENT_MAX_FAILURES = int(os.getenv("AGENT_MAX_FAILURES", "8"))
+AGENT_STEP_TIMEOUT = int(os.getenv("AGENT_STEP_TIMEOUT", "240"))
+AGENT_LLM_TIMEOUT = int(os.getenv("AGENT_LLM_TIMEOUT", "120"))
 
 
 def _build_llm(provider: str, model: str):
@@ -152,6 +155,9 @@ async def background_runner(
             llm=llm,
             fallback_llm=fallback_llm,
             use_vision=True,
+            max_failures=AGENT_MAX_FAILURES,
+            step_timeout=AGENT_STEP_TIMEOUT,
+            llm_timeout=AGENT_LLM_TIMEOUT,
             browser_profile=profile,
             tools=tools,
             file_system_path=session_fs_path,
@@ -333,6 +339,9 @@ async def execute_agent(task: str, provider: str, model: str, fallback_provider:
             llm=llm,
             fallback_llm=fallback_llm,
             use_vision=True,
+            max_failures=AGENT_MAX_FAILURES,
+            step_timeout=AGENT_STEP_TIMEOUT,
+            llm_timeout=AGENT_LLM_TIMEOUT,
             browser_profile=profile
         )
         

@@ -1937,59 +1937,87 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		kwargs: dict = {'output_format': self.AgentOutput, 'session_id': self.session_id}
 
 		try:
-			response = await self.llm.ainvoke(input_messages, **kwargs)
-			parsed: AgentOutput = response.completion  # type: ignore[assignment]
-
-			# Replace any shortened URLs in the LLM response back to original URLs
-			if urls_replaced:
-				self._recursive_process_all_strings_inside_pydantic_model(parsed, urls_replaced)
-
-			# cut the number of actions to max_actions_per_step if needed
-			if len(parsed.action) > self.settings.max_actions_per_step:
-				parsed.action = parsed.action[: self.settings.max_actions_per_step]
-
-			if not (hasattr(self.state, 'paused') and (self.state.paused or self.state.stopped)):
-				log_response(parsed, self.tools.registry.registry, self.logger)
-				await self._broadcast_model_state(parsed)
-
-			self._log_next_action_summary(parsed)
-			return parsed
+			return await self._invoke_model_for_output(
+				llm=self.llm,
+				input_messages=input_messages,
+				invoke_kwargs=kwargs,
+				url_replacements=urls_replaced,
+			)
 		except ValidationError:
 			# Just re-raise - Pydantic's validation errors are already descriptive
 			raise
 		except (ModelRateLimitError, ModelProviderError) as e:
-			# Check if we can switch to a fallback LLM
+			# Check if this error is eligible for fallback retry
 			if not self._try_switch_to_fallback_llm(e):
 				# No fallback available, re-raise the original error
 				raise
-			# Retry with the fallback LLM
-			return await self.get_model_output(input_messages)
+			# Retry this step once with fallback, but keep primary as default for future steps
+			assert self._fallback_llm is not None
+			try:
+				self._using_fallback_llm = True
+				return await self._invoke_model_for_output(
+					llm=self._fallback_llm,
+					input_messages=input_messages,
+					invoke_kwargs=kwargs,
+					url_replacements=urls_replaced,
+				)
+			except ValidationError:
+				raise
+			except (ModelRateLimitError, ModelProviderError) as fallback_error:
+				self.logger.warning(
+					f'⚠️ Fallback LLM also failed ({type(fallback_error).__name__}: {fallback_error.message}), '
+					're-raising fallback error'
+				)
+				raise
+			finally:
+				self._using_fallback_llm = False
 
-	def _try_switch_to_fallback_llm(self, error: ModelRateLimitError | ModelProviderError) -> bool:
-		"""
-		Attempt to switch to a fallback LLM after a rate limit or provider error.
-
-		Returns True if successfully switched to a fallback, False if no fallback available.
-		Once switched, the agent will use the fallback LLM for the rest of the run.
-		"""
-		# Already using fallback - can't switch again
-		if self._using_fallback_llm:
-			self.logger.warning(
-				f'⚠️ Fallback LLM also failed ({type(error).__name__}: {error.message}), no more fallbacks available'
-			)
-			return False
-
+	def _can_use_fallback_for_error(self, error: ModelRateLimitError | ModelProviderError) -> bool:
+		"""Return True when a provider/rate-limit error should trigger fallback retry."""
 		# Check if error is retryable (rate limit, auth errors, or server errors)
 		# 401: API key invalid/expired - fallback to different provider
 		# 402: Insufficient credits/payment required - fallback to different provider
 		# 429: Rate limit exceeded
 		# 500, 502, 503, 504: Server errors
 		retryable_status_codes = {401, 402, 429, 500, 502, 503, 504}
-		is_retryable = isinstance(error, ModelRateLimitError) or (
+		return isinstance(error, ModelRateLimitError) or (
 			hasattr(error, 'status_code') and error.status_code in retryable_status_codes
 		)
 
-		if not is_retryable:
+	async def _invoke_model_for_output(
+		self,
+		llm: BaseChatModel,
+		input_messages: list[BaseMessage],
+		invoke_kwargs: dict[str, Any],
+		url_replacements: dict[str, str],
+	) -> AgentOutput:
+		"""Invoke the provided model and normalize the response into AgentOutput."""
+		response = await llm.ainvoke(input_messages, **invoke_kwargs)
+		parsed: AgentOutput = response.completion  # type: ignore[assignment]
+
+		# Replace any shortened URLs in the LLM response back to original URLs
+		if url_replacements:
+			self._recursive_process_all_strings_inside_pydantic_model(parsed, url_replacements)
+
+		# cut the number of actions to max_actions_per_step if needed
+		if len(parsed.action) > self.settings.max_actions_per_step:
+			parsed.action = parsed.action[: self.settings.max_actions_per_step]
+
+		if not (hasattr(self.state, 'paused') and (self.state.paused or self.state.stopped)):
+			log_response(parsed, self.tools.registry.registry, self.logger)
+			await self._broadcast_model_state(parsed)
+
+		self._log_next_action_summary(parsed)
+		return parsed
+
+	def _try_switch_to_fallback_llm(self, error: ModelRateLimitError | ModelProviderError) -> bool:
+		"""
+		Check whether we should use fallback LLM for the current failed model request.
+
+		Returns True when fallback is available and the error is retryable.
+		Fallback is used per-request; the primary model remains default for the next step.
+		"""
+		if not self._can_use_fallback_for_error(error):
 			return False
 
 		# Check if we have a fallback LLM configured
@@ -1998,10 +2026,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return False
 
 		self._log_fallback_switch(error, self._fallback_llm)
-
-		# Switch to the fallback LLM
-		self.llm = self._fallback_llm
-		self._using_fallback_llm = True
 
 		# Register the fallback LLM for token cost tracking
 		self.token_cost_service.register_llm(self._fallback_llm)
