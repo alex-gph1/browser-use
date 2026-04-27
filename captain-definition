@@ -1,7 +1,8 @@
- {
-    "schemaVersion": 2,
-    "dockerfilePath": "Dockerfile.app",
-    "buildArgs": {
-        "CACHE_BUSTER": "1"
-    }
- }
+{
+  "schemaVersion": 2,
+  "dockerfilePath": "Dockerfile.app",
+  "buildArgs": {
+    "CACHE_BUSTER": "1",
+    "BROWSER_USE_BASE_IMAGE": "browseruse/browseruse:latest"
+  }
+}

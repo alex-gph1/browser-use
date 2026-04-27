@@ -1,10 +1,13 @@
-# Use the official pre-built image
-FROM browseruse/browseruse:latest
+# CapRover passes this arg so webhook deploys can pin an immutable GHCR image.
+ARG BROWSER_USE_BASE_IMAGE=browseruse/browseruse:latest
+FROM ${BROWSER_USE_BASE_IMAGE}
 
-# Add a build argument. Change its value in captain-definition to force a fresh build.
+ARG BROWSER_USE_BASE_IMAGE
 ARG CACHE_BUSTER=1
 
 USER root
+
+RUN echo "base-image=${BROWSER_USE_BASE_IMAGE} cache-buster=${CACHE_BUSTER}" > /tmp/.caprover-cache-buster
 
 # Install web server components and ensure the core library is up-to-date
 RUN uv pip install --upgrade browser-use uvicorn gradio
