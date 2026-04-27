@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "dockerfilePath": "Dockerfile.app",
   "buildArgs": {
-    "CACHE_BUSTER": "1",
-    "BROWSER_USE_BASE_IMAGE": "browseruse/browseruse:latest"
+    "CACHE_BUSTER": "2",
+    "BROWSER_USE_BASE_IMAGE": "ghcr.io/alex-gph1/browser-use:sha-4da840b55c05"
   }
 }
